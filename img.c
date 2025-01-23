@@ -2,11 +2,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <png.h>
+#include <math.h>
 #include <immintrin.h>
-#include <x86intrin.h>
 
-#define WIDTH 8192
-#define HEIGHT 8192
+#include "ubench.h"
+
+#define WIDTH 1024
+#define HEIGHT 1024
 #define MAX_ITERATIONS 200
 #define X_SCALE 4.0
 #define Y_SCALE 4.0
@@ -41,9 +43,9 @@ __m256i mandelbrot_simd(__m256 x, __m256 y) {
     }
 
     // Ugly and can be done easier but loses precision, so we'll go with this way to get equivalent results
-    __m256i c = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_div_ps(_mm256_cvtepi32_ps(iterations), _mm256_cvtepi32_ps(max_iterations)), _mm256_set1_ps(255.0f)));
+    //__m256i c = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_div_ps(_mm256_cvtepi32_ps(iterations), _mm256_cvtepi32_ps(max_iterations)), _mm256_set1_ps(255.0f)));
 
-    return c;
+    return iterations;
 }
 
 void mandelbrot(png_bytep px, int x, int y) {
@@ -59,15 +61,19 @@ void mandelbrot(png_bytep px, int x, int y) {
         iterations++;
     }
 
-    int c = (int)((iterations / (float)MAX_ITERATIONS) * 255);
-    px[0] = c;
-    px[1] = c;
-    px[2] = c;
+    int r = (int)(255 * sinf(0.1 * iterations));
+    int g = (int)(255 * sinf(0.2 * iterations));
+    int b = (int)(255 * sinf(0.3 * iterations));
+    if (iterations == MAX_ITERATIONS) {
+        r = g = b = 0;
+    }
+    px[0] = r;
+    px[1] = g;
+    px[2] = b;
 }
 
 void render(png_structp png, png_infop info, png_bytepp row_pointers) {
     for(int y = 0; y < HEIGHT; y++) {
-        row_pointers[y] = (png_bytep)malloc(png_get_rowbytes(png, info));
         for(int x = 0; x < WIDTH; x++) {
             png_bytep px = &(row_pointers[y][x * 3]);
             mandelbrot(px, x, y);
@@ -78,49 +84,60 @@ void render(png_structp png, png_infop info, png_bytepp row_pointers) {
 void render_simd(png_structp png, png_infop info, png_bytepp row_pointers) {
     __m256 xx = _mm256_setr_ps(0, 1, 2, 3, 4, 5, 6, 7);
     for(int y = 0; y < HEIGHT; y++) {
-        row_pointers[y] = (png_bytep)malloc(png_get_rowbytes(png, info));
         for(int x = 0; x < WIDTH; x+=8) {
             png_bytep px = &(row_pointers[y][x * 3]);
-            __m256i c = mandelbrot_simd(_mm256_add_ps(_mm256_set1_ps(x), xx), _mm256_set1_ps(y));
-            int c0[8];
-            _mm256_storeu_si256((__m256i*)c0, c);
+            __m256i iterations = mandelbrot_simd(_mm256_add_ps(_mm256_set1_ps(x), xx), _mm256_set1_ps(y));
+            __m256 iterationsf = _mm256_cvtepi32_ps(iterations);
+            __m256 scale = _mm256_set1_ps(255.f);
+            __m256i rx = _mm256_cvttps_epi32(_mm256_mul_ps(_mm256_sin_ps(_mm256_mul_ps(iterationsf, _mm256_set1_ps(0.1f))), scale));
+            __m256i gx = _mm256_cvttps_epi32(_mm256_mul_ps(_mm256_sin_ps(_mm256_mul_ps(iterationsf, _mm256_set1_ps(0.2f))), scale));
+            __m256i bx = _mm256_cvttps_epi32(_mm256_mul_ps(_mm256_sin_ps(_mm256_mul_ps(iterationsf, _mm256_set1_ps(0.3f))), scale));
+            __m256i mask = _mm256_cmpeq_epi32(iterations, _mm256_set1_epi32(MAX_ITERATIONS));
+            rx = _mm256_blendv_epi8(rx, _mm256_set1_epi32(0), mask);
+            gx = _mm256_blendv_epi8(gx, _mm256_set1_epi32(0), mask);
+            bx = _mm256_blendv_epi8(bx, _mm256_set1_epi32(0), mask);
+
+            int r[8], g[8], b[8];
+            _mm256_storeu_si256((__m256i*)r, rx);
+            _mm256_storeu_si256((__m256i*)g, gx);
+            _mm256_storeu_si256((__m256i*)b, bx);
 
             for (int i = 0; i < 8; i++) {
-                px[i*3] = c0[i];
-                px[i*3+1] = c0[i];
-                px[i*3+2] = c0[i];
+                px[i * 3] = r[i];
+                px[i * 3 + 1] = g[i];
+                px[i * 3 + 2] = b[i];
             }
         }
     }
 }
 
-int main(void) {
+int setup_png(FILE** fp, png_structp* png, png_infop* info, png_bytepp* row_pointers) {
     png_byte bit_depth = 8;
     png_byte color_type = PNG_COLOR_TYPE_RGB;
 
-    FILE *fp = fopen("out.png", "wb");
-    if(!fp) {
+    *fp = fopen("out.png", "wb");
+    if(!*fp) {
         fprintf(stderr, "Could not open file for writing\n");
         return 1;
     }
 
-    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-    if (!png) {
+    *png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!*png) {
         fprintf(stderr, "Could not allocate write struct\n");
         return 1;
     }
 
-    png_infop info = png_create_info_struct(png);
-    if (!info) {
+    *info = png_create_info_struct(*png);
+    if (!*info) {
         fprintf(stderr, "Could not allocate info struct\n");
         return 1;
     }
 
-    png_init_io(png, fp);
+    png_init_io(*png, *fp);
 
     png_set_IHDR(
-        png,
-        info,
+        *png,
+        *info,
         WIDTH, HEIGHT,
         bit_depth,
         color_type,
@@ -128,19 +145,90 @@ int main(void) {
         PNG_COMPRESSION_TYPE_DEFAULT,
         PNG_FILTER_TYPE_DEFAULT
     );
-    png_write_info(png, info);
+    png_write_info(*png, *info);
 
-    png_bytepp row_pointers = (png_bytepp)malloc(sizeof(png_bytep) * HEIGHT);
-    render_simd(png, info, row_pointers);
-    
-    png_write_image(png, row_pointers);
+    *row_pointers = (png_bytepp)malloc(sizeof(png_bytep) * HEIGHT);
+    for (int y = 0; y < HEIGHT; y++) {
+        (*row_pointers)[y] = (png_bytep)malloc(png_get_rowbytes(*png, *info));
+    }
 
-    png_write_end(png, NULL);
+    return 0;
+}
 
+int destroy_png_nowrite(FILE* fp, png_structp png, png_infop info, png_bytepp row_pointers) {
     fclose(fp);
     png_free_data(png, info, PNG_FREE_ALL, -1);
     png_destroy_write_struct(&png, &info);
     free(row_pointers);
+    return 0;
+}
+
+int destroy_png_write(FILE* fp, png_structp png, png_infop info, png_bytepp row_pointers) {
+    png_write_image(png, row_pointers);
+    png_write_end(png, NULL);
+    return destroy_png_nowrite(fp, png, info, row_pointers);
+}
+
+#ifdef BENCH
+
+UBENCH_EX(mandelbrot, sisd) {
+    FILE* fp;
+    png_structp png;
+    png_infop info;
+    png_bytepp row_pointers;
+
+    if (setup_png(&fp, &png, &info, &row_pointers)) {
+        return;
+    }
+
+    UBENCH_DO_BENCHMARK() {
+        render(png, info, row_pointers);
+    }
+    
+    if (destroy_png_nowrite(fp, png, info, row_pointers)) {
+        return;
+    }
+}
+
+UBENCH_EX(mandelbrot, simd) {
+    FILE* fp;
+    png_structp png;
+    png_infop info;
+    png_bytepp row_pointers;
+
+    if (setup_png(&fp, &png, &info, &row_pointers)) {
+        return;
+    }
+
+    UBENCH_DO_BENCHMARK() {
+        render_simd(png, info, row_pointers);
+    }
+    
+    if (destroy_png_nowrite(fp, png, info, row_pointers)) {
+        return;
+    }
+}
+
+UBENCH_MAIN();
+
+#else
+
+int main(void) {
+    FILE* fp;
+    png_structp png;
+    png_infop info;
+    png_bytepp row_pointers;
+
+    if (setup_png(&fp, &png, &info, &row_pointers)) {
+        return 1;
+    }
+
+    render_simd(png, info, row_pointers);
+    
+    if (destroy_png_write(fp, png, info, row_pointers)) {
+        return 1;
+    }
 
     return 0;
 }
+#endif
